@@ -67,8 +67,8 @@ GRIP_RATE = 7.0                  # how fast sideways sliding is killed (1/s)
 SLIDE_KEEP = 0.93                # share of killed sideways speed returned as forward speed
 HANDBRAKE_YAW_RATE = 2.7         # turn rate while drifting (rad/s), not capped by speed
 HANDBRAKE_GRIP_RATE = 1.2        # sideways grip while drifting (low = long slides)
-HANDBRAKE_SLIDE_KEEP = 0.55      # drifting scrubs more speed
-HANDBRAKE_DRAG = 0.38            # fraction of speed lost per second on the handbrake
+HANDBRAKE_SLIDE_KEEP = 0.72      # drifting scrubs more speed
+HANDBRAKE_DRAG = 0.25            # fraction of speed lost per second on the handbrake
 LOW_SPEED_BOOST = 9.0            # extra m/s^2 when well below the start speed (crash recovery)
 MAX_SPEED_SANITY = 150.0         # physics safety net only (540 km/h)
 
@@ -79,9 +79,12 @@ WALL_RESTITUTION = 0.25
 WALL_DAMAGE_PER_MS = 1.15        # health lost per m/s of impact speed into a wall ...
 WALL_DAMAGE_THRESHOLD = 3.5      # ... above this impact speed
 CAR_RESTITUTION = 0.35
-CAR_HIT_DAMAGE_BASE = 5.0        # health lost per police contact ...
-CAR_HIT_DAMAGE_PER_MS = 0.9      # ... plus this per m/s of closing speed
-CAR_HIT_COOLDOWN = 0.5           # seconds between damage ticks from the same police car
+CAR_HIT_DAMAGE_BASE = 3.0        # health lost per police ram ...
+CAR_HIT_DAMAGE_PER_MS = 0.9      # ... plus this per m/s of closing speed above 2 m/s ...
+CAR_HIT_DAMAGE_MAX = 25.0        # ... capped per hit
+CAR_HIT_COOLDOWN = 0.7           # seconds between rams from the same police car
+PIN_SPEED = 6.0                  # boxed in: touching police below this speed (m/s) ...
+PIN_DAMAGE = 9.0                 # ... drains this much health per second
 PLAYER_HEALTH = 100.0
 POLICE_HEALTH = 70.0             # police wreck themselves on walls and each other
 
@@ -121,6 +124,7 @@ POLICE_LOS_INTERVAL = 0.25       # seconds between each car's line-of-sight chec
 #   police_accel ............ police acceleration (m/s^2)
 #   police_grip, police_yaw . police cornering grip (m/s^2) and max turn rate (rad/s)
 #   police_lookahead ........ how many seconds ahead police predict where you'll be
+#   police_ram .............. how much faster than you (m/s) police drive when ramming
 #   max_police .............. most police chasing at once ...
 #   start_police, ramp_every  ... starting at this many, +1 allowed every N seconds
 #   first_spawn, spawn_interval  seconds before the first spawn / between spawns
@@ -129,30 +133,30 @@ POLICE_LOS_INTERVAL = 0.25       # seconds between each car's line-of-sight chec
 DIFFICULTY_NAMES = ("Easy", "Normal", "Hard")
 DIFFICULTY = {
     "Easy": dict(
-        start_speed=15.0, accel=0.20,
+        start_speed=15.0, accel=0.30,
         police_min_top=21.0, police_speed_ratio=0.88, police_accel=7.0,
-        police_grip=16.0, police_yaw=1.35, police_lookahead=0.5,
+        police_grip=16.0, police_yaw=1.35, police_lookahead=0.5, police_ram=3.0,
         max_police=2, start_police=1, ramp_every=35.0,
         first_spawn=7.0, spawn_interval=12.0,
         damage_mult=0.55, regen=3.0, regen_delay=5.0,
         blurb="Gentle acceleration, slow police, up to 2 chasers, health regenerates.",
     ),
     "Normal": dict(
-        start_speed=17.0, accel=0.32,
+        start_speed=17.0, accel=0.45,
         police_min_top=27.0, police_speed_ratio=1.0, police_accel=10.0,
-        police_grip=22.0, police_yaw=1.8, police_lookahead=1.0,
+        police_grip=22.0, police_yaw=1.8, police_lookahead=1.0, police_ram=5.0,
         max_police=4, start_police=1, ramp_every=18.0,
         first_spawn=4.0, spawn_interval=7.0,
         damage_mult=1.0, regen=1.0, regen_delay=8.0,
         blurb="Police keep pace with you. Up to 4 chasers.",
     ),
     "Hard": dict(
-        start_speed=20.0, accel=0.48,
-        police_min_top=33.0, police_speed_ratio=1.12, police_accel=14.0,
-        police_grip=30.0, police_yaw=2.3, police_lookahead=1.5,
-        max_police=7, start_police=2, ramp_every=10.0,
-        first_spawn=2.0, spawn_interval=3.5,
-        damage_mult=1.3, regen=0.0, regen_delay=0.0,
+        start_speed=20.0, accel=0.65,
+        police_min_top=29.0, police_speed_ratio=1.12, police_accel=14.0,
+        police_grip=30.0, police_yaw=2.3, police_lookahead=1.5, police_ram=7.5,
+        max_police=7, start_police=1, ramp_every=12.0,
+        first_spawn=4.0, spawn_interval=4.5,
+        damage_mult=1.2, regen=0.0, regen_delay=0.0,
         blurb="Fast, sharp-turning police that out-think you. Up to 7. No healing.",
     ),
 }
@@ -1027,6 +1031,7 @@ class Car:
         self.heading = heading
         self.vx, self.vz = math.sin(heading) * speed, math.cos(heading) * speed
         self.police = police
+        self.mass = 1.0 if police else 1.4      # rams hurt the police car more than you
         self.mesh = car_mesh(police)
         self.health = POLICE_HEALTH if police else PLAYER_HEALTH
         self.steer = 0.0
@@ -1152,7 +1157,8 @@ class Car:
 
 
 def collide_cars(a, b):
-    """Circle-pair collision with an equal-mass impulse. Returns the closing speed."""
+    """Circle-pair collision with an equal-mass impulse. Returns the closing speed
+    (a tiny positive value for a resting touch, 0 when apart)."""
     if abs(a.x - b.x) > 6.0 or abs(a.z - b.z) > 6.0:
         return 0.0
     r2 = 2.0 * CAR_RADIUS
@@ -1163,19 +1169,29 @@ def collide_cars(a, b):
             d2 = dx * dx + dz * dz
             if d2 >= r2 * r2 or d2 < 1e-12:
                 continue
+            best = max(best, 1e-3)        # touching, even if not closing
             d = math.sqrt(d2)
-            nx, nz, pen = dx / d, dz / d, (r2 - d) * 0.5
-            a.x += nx * pen
-            a.z += nz * pen
-            b.x -= nx * pen
-            b.z -= nz * pen
+            nx, nz = dx / d, dz / d
+            wa = b.mass / (a.mass + b.mass)          # the lighter car gets pushed further
+            pen = r2 - d
+            a.x += nx * pen * wa
+            a.z += nz * pen * wa
+            b.x -= nx * pen * (1.0 - wa)
+            b.z -= nz * pen * (1.0 - wa)
             rel = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz
             if rel < 0.0:
-                j = -(1.0 + CAR_RESTITUTION) * rel * 0.5
-                a.vx += j * nx
-                a.vz += j * nz
-                b.vx -= j * nx
-                b.vz -= j * nz
+                j = -(1.0 + CAR_RESTITUTION) * rel / (1.0 / a.mass + 1.0 / b.mass)
+                cx, cz = (ax + bx) * 0.5, (az + bz) * 0.5
+                for car, s in ((a, j / a.mass), (b, -j / b.mass)):
+                    car.vx += s * nx
+                    car.vz += s * nz
+                    # Off-centre hits twist the car (a PIT manoeuvre on a rear corner).
+                    sh, ch = math.sin(car.heading), math.cos(car.heading)
+                    rf = (cx - car.x) * sh + (cz - car.z) * ch       # lever arm, forward
+                    rr = (cx - car.x) * ch - (cz - car.z) * sh       # lever arm, right
+                    ff = s * (nx * sh + nz * ch)                     # impulse, forward
+                    fr = s * (nx * ch - nz * sh)                     # impulse, right
+                    car.heading = wrap_angle(car.heading + clamp((rf * fr - rr * ff) * 0.05, -0.25, 0.25))
                 best = max(best, -rel)
     return best
 
@@ -1271,10 +1287,6 @@ class SkidMarks:
         self.head = 0
         self.last = {}
 
-    def clear(self):
-        self.count = self.head = 0
-        self.last.clear()
-
     def track(self, key, x, z, y, active):
         if not active:
             self.last.pop(key, None)
@@ -1307,8 +1319,10 @@ class Police(Car):
     Steering is pure pursuit on a *predicted* target: where the player will be after
     the time it takes to get there (capped by the difficulty's lookahead). When a
     building blocks the line of sight the car follows the road grid instead,
-    hopping between intersections greedily towards the target. A short feeler ray
-    steers it around walls, and it backs out if it gets stuck.
+    hopping between intersections greedily towards the target. Up close it rams at
+    a controlled speed and drops back after each hit; facing you head-on it slows
+    down to block. A short feeler ray steers it around walls, and it backs out if
+    it gets stuck.
     """
 
     def __init__(self, x, z, heading, speed=0.0):
@@ -1322,6 +1336,7 @@ class Police(Car):
         self.reverse_steer = 1.0
         self.wreck_time = 0.0
         self.hit_cooldown = 0.0
+        self.backoff = 0.0            # after a ram, drop back for a moment
 
     def think(self, dt, player, world, diff):
         """Returns (steer, accel) for this frame."""
@@ -1354,8 +1369,16 @@ class Police(Car):
         steer = clamp(err * 2.2, -1.0, 1.0)
         top = max(diff["police_min_top"], diff["police_speed_ratio"] * player.speed)
         target_speed = top * clamp(1.15 - abs(err) / 1.4, 0.32, 1.0)   # brake for corners
-        if dist < 25.0 and abs(err) < 0.6:                               # go for the ram
-            target_speed = max(target_speed, min(top * 1.1, player.speed + 6.0))
+        if dist < 35.0:
+            # Close in at a controlled speed: from behind they ram at your speed plus
+            # police_ram; coming head-on they slow right down and try to block you.
+            if math.cos(player.heading - self.heading) < -0.3:
+                target_speed = min(target_speed, 10.0)
+            elif self.backoff > 0.0:
+                target_speed = min(target_speed, player.speed * 0.85)
+            else:
+                target_speed = min(target_speed, player.speed + diff["police_ram"])
+        self.backoff -= dt
 
         # Feeler: a wall straight ahead? steer to the open side and slow down.
         reach = 4.0 + sp * 0.35
@@ -1665,7 +1688,7 @@ class Scene:
                 continue
             if pr[2] > 160.0 or world.raycast(cam.x, cam.y, cam.z, wx, wy, wz, first_hit=True) < 0.98:
                 continue
-            size = int(clamp(4.5 * cam.focal / pr[2], 10, 200)) // 6 * 6 + 6
+            size = int(clamp(4.5 * cam.focal / pr[2], 10, 200)) // 12 * 12 + 12   # few sizes to cache
             colr = COL_SIREN_RED if on else COL_SIREN_BLUE
             g = self._glow_cache.get((colr, size))
             if g is None:
@@ -1931,6 +1954,7 @@ class PlayState(State):
         self.hurt = 0.0
         self.busted = False
         self.busted_time = 0.0
+        self.boxed_in = 0.0
         self.handbrake = False
         self.smoke_timer = 0.0
         self.scene.follow(self.player, 0.0, snap=True)
@@ -1956,7 +1980,8 @@ class PlayState(State):
             self.busted = True
 
     def handle(self, e):
-        if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and not self.busted:
+        focus_lost = e.type == getattr(pygame, "WINDOWFOCUSLOST", -1)   # alt-tab pauses too
+        if (focus_lost or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE)) and not self.busted:
             self.game.change(PauseState(self.game, self))
 
     def update(self, dt):
@@ -1996,6 +2021,7 @@ class PlayState(State):
                 if car.wrecked:
                     car.wreck_time += dt
         self.hurt = max(0.0, self.hurt - dt * 1.8)
+        self.boxed_in = max(0.0, self.boxed_in - dt)
         self._effects(dt)
         self.world.stream(p.x, p.z)
         self.director.update(dt, self)
@@ -2028,6 +2054,7 @@ class PlayState(State):
                 self.scene.particles.sparks(cop.x, 0.6, cop.z, 6, cop.vx, cop.vz)
 
         cars = [p] + self.police
+        boxed_in = False
         for i in range(len(cars)):
             a = cars[i]
             for j in range(i + 1, len(cars)):
@@ -2038,13 +2065,24 @@ class PlayState(State):
                 if closing > 4.0:
                     self.scene.particles.sparks((a.x + b.x) * 0.5, 0.7, (a.z + b.z) * 0.5, int(3 + closing * 0.4))
                 if a is p:
-                    if b.hit_cooldown <= 0.0 and not b.wrecked:
+                    boxed_in |= not b.wrecked
+                    if closing > 2.0 and b.hit_cooldown <= 0.0 and not b.wrecked:
                         b.hit_cooldown = CAR_HIT_COOLDOWN
-                        self.damage(CAR_HIT_DAMAGE_BASE + CAR_HIT_DAMAGE_PER_MS * closing)
-                    self._hurt_cop(b, closing * 0.8)
+                        b.backoff = random.uniform(1.0, 2.0)
+                        self.damage(min(CAR_HIT_DAMAGE_MAX,
+                                        CAR_HIT_DAMAGE_BASE + CAR_HIT_DAMAGE_PER_MS * (closing - 2.0)))
+                    if closing > 2.0:
+                        self._hurt_cop(b, closing * 0.8)
                 else:
                     self._hurt_cop(a, max(0.0, closing - 4.0) * 1.2)
                     self._hurt_cop(b, max(0.0, closing - 4.0) * 1.2)
+        # Pinned by police at low speed: health drains away until you break free.
+        if boxed_in and p.speed < PIN_SPEED and not self.busted:
+            self.boxed_in = 0.25
+            self.since_hit = 0.0
+            p.health = max(0.0, p.health - PIN_DAMAGE * diff["damage_mult"] * dt)
+            if p.health <= 0.0:
+                self.busted = True
 
     def _hurt_cop(self, cop, amount):
         if cop.wrecked or amount <= 0.0:
@@ -2081,25 +2119,26 @@ class PlayState(State):
             self._hurt_vignette(surf)
         if hud:
             self.draw_hud(surf)
-        if self.busted:
+            if self.boxed_in > 0.0 and not self.busted and (self.time * 4.0) % 1.0 < 0.6:
+                self.game.ui.draw(surf, "BOXED IN!  GET MOVING", 44, UI_DANGER, (SCREEN_W * 0.5, SCREEN_H * 0.3))
+        if self.busted and hud:
             ui = self.game.ui
             k = min(1.0, self.busted_time * 2.0)
             ui.draw(surf, "BUSTED!", int(90 + 60 * k), UI_DANGER, (SCREEN_W * 0.5, SCREEN_H * 0.35))
 
     def _hurt_vignette(self, surf):
-        """Red glow creeping in from the screen edges after a hit (additive rings)."""
+        """Red frame around the screen after a hit (plain fills: blended ones are slow)."""
         W, H = surf.get_size()
-        add = pygame.BLEND_ADD
-        for i in range(7):
-            v = int(130 * self.hurt * (1.0 - i / 7.0) ** 1.5)
-            if v <= 0:
-                break
-            t, w = 14 * i, 14
-            col = (v, 0, 0)
-            surf.fill(col, (t, t, W - 2 * t, w), special_flags=add)
-            surf.fill(col, (t, H - t - w, W - 2 * t, w), special_flags=add)
-            surf.fill(col, (t, t + w, w, H - 2 * (t + w)), special_flags=add)
-            surf.fill(col, (W - t - w, t + w, w, H - 2 * (t + w)), special_flags=add)
+        k = min(1.0, self.hurt)
+        for i, (shade_k, width) in enumerate(((0.55, 22), (0.8, 12), (1.0, 5))):
+            t = int(width * k)
+            if t <= 0:
+                continue
+            col = (int(150 + 90 * shade_k * k), int(30 * (1 - k)), int(30 * (1 - k)))
+            surf.fill(col, (0, 0, W, t))
+            surf.fill(col, (0, H - t, W, t))
+            surf.fill(col, (0, 0, t, H))
+            surf.fill(col, (W - t, 0, t, H))
 
     def draw_hud(self, surf):
         ui, p = self.game.ui, self.player
