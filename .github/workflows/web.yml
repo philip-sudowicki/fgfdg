@@ -1,0 +1,61 @@
+# Builds the browser version with pygbag and publishes it on GitHub Pages:
+#   https://<owner>.github.io/<repo>/
+# One-time setup: repo Settings > Pages > Build and deployment > Source: "GitHub Actions".
+# Until then the build still runs and the deploy step is skipped with a notice.
+name: Web version
+
+on:
+  push:
+    branches: [main, claude/pako-chase-game-rdhnin]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.pages.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build with pygbag
+        run: |
+          pip install pygbag==0.9.3
+          mkdir -p web
+          cp pako_chase.py web/main.py
+          python -m pygbag --build --title "PAKO CHASE" web
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/build/web
+      - name: Check that GitHub Pages is switched on
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" --silent 2>/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub Pages is off. Turn it on in Settings > Pages > Source: GitHub Actions, then re-run this workflow."
+          fi
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.pages_enabled == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

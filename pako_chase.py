@@ -5,6 +5,11 @@ PAKO CHASE -- an endless low-poly police chase through a procedural city.
     python pako_chase.py                play
     python pako_chase.py --smoke-test   headless crash test (no window needed)
 
+It also runs in a web browser via pygbag (pip install pygbag): copy this file to
+an empty folder as main.py and run `pygbag folder` (or `pygbag --build folder`
+to get a static site in folder/build/web for itch.io / GitHub Pages).
+.github/workflows/web.yml does exactly that and publishes it on GitHub Pages.
+
 Controls: the mouse's horizontal distance from the screen centre sets the
 steering angle (further out = sharper turn). Hold the LEFT mouse button to
 handbrake / drift. Esc pauses, F3 toggles the FPS counter.
@@ -21,6 +26,7 @@ Only pygame and numpy are needed. The file is organised as:
     7. MAIN LOOP ......... Game object, main(), smoke test
 """
 
+import asyncio
 import json
 import math
 import os
@@ -92,6 +98,7 @@ POLICE_HEALTH = 70.0             # police wreck themselves on walls and each oth
 SCORE_PER_SECOND = 10.0          # score = time survived * this ...
 SCORE_PER_METRE = 0.25           # ... + distance driven * this
 SCORE_FILE = os.path.join(os.path.expanduser("~"), ".pako_chase_scores.json")
+SCORE_KEY = "pako_chase_scores"  # localStorage key used instead of the file in a browser
 
 # --- World -------------------------------------------------------------------
 WORLD_SEED = 20261019            # change for a different city
@@ -208,6 +215,16 @@ UI_DIM = (172, 174, 186)
 UI_PANEL = (16, 18, 26)
 UI_DANGER = (236, 60, 60)
 UI_OK = (92, 212, 112)
+
+# --- Browser build (pygbag) --------------------------------------------------
+# Python in WebAssembly runs roughly 2-3x slower, so the web version trades a
+# little resolution and draw distance for frame rate. Nothing else changes.
+WEB = sys.platform == "emscripten"
+WEB_SCREEN = (1024, 576)
+WEB_VIEW_DIST = 220.0
+if WEB:
+    SCREEN_W, SCREEN_H = WEB_SCREEN
+    VIEW_DIST = WEB_VIEW_DIST
 
 
 # =============================================================================
@@ -1825,8 +1842,9 @@ class MenuState(State):
         self.buttons = [
             Button("PLAY", (cx, H * 0.335), game.start_run, w=330, h=62, size=46),
             Button("CONTROLS", (cx, H * 0.735), lambda: game.change(ControlsState(game, self))),
-            Button("QUIT", (cx, H * 0.83), game.quit),
         ]
+        if not WEB:      # quitting a web page just freezes it; close the tab instead
+            self.buttons.append(Button("QUIT", (cx, H * 0.83), game.quit))
         self.diff_buttons = [
             Button(name, (cx + (k - 1) * 142, H * 0.475), lambda n=name: game.set_difficulty(n), w=134, h=46, size=32)
             for k, name in enumerate(DIFFICULTY_NAMES)]
@@ -1896,7 +1914,7 @@ class ControlsState(State):
         ("SPEED", "Your car accelerates by itself and never stops getting faster. Staying in "
                   "control is the challenge."),
         ("DAMAGE", "Hitting buildings or police costs health. At zero health you are BUSTED."),
-        ("PAUSE", "Esc pauses the game. F3 toggles the FPS counter."),
+        ("PAUSE", "Esc or P pauses the game. F3 toggles the FPS counter."),
         ("TIPS", "Start drifts before the intersection, lure police into walls and watch the "
                  "radar for cars coming from side streets."),
     )
@@ -1980,8 +1998,11 @@ class PlayState(State):
             self.busted = True
 
     def handle(self, e):
-        focus_lost = e.type == getattr(pygame, "WINDOWFOCUSLOST", -1)   # alt-tab pauses too
-        if (focus_lost or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE)) and not self.busted:
+        # Esc/P pause; so does alt-tab, and in a browser the mouse leaving the game area.
+        pause = (e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_p)
+                 or e.type == getattr(pygame, "WINDOWFOCUSLOST", -1)
+                 or WEB and e.type == getattr(pygame, "WINDOWLEAVE", -1))
+        if pause and not self.busted:
             self.game.change(PauseState(self.game, self))
 
     def update(self, dt):
@@ -2232,7 +2253,7 @@ class PauseState(State):
         for b in self.buttons:
             if b.handle(e):
                 return
-        if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+        if e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_p):
             self.resume()
 
     def draw(self, surf):
@@ -2331,7 +2352,8 @@ class Game:
     def change(self, state):
         self.state = state
         pygame.mouse.set_visible(state.cursor_visible)
-        pygame.event.set_grab(not state.cursor_visible)   # keep the mouse in the window while driving
+        if not WEB:   # in a browser a grab becomes pointer lock, which swallows Esc
+            pygame.event.set_grab(not state.cursor_visible)   # keep the mouse in the window while driving
 
     def set_difficulty(self, name):
         self.difficulty = name
@@ -2349,11 +2371,16 @@ class Game:
         best = {n: 0 for n in DIFFICULTY_NAMES}
         if self.save_scores:
             try:
-                with open(SCORE_FILE, encoding="utf-8") as f:
-                    data = json.load(f)
+                store = browser_storage()
+                if store is not None:
+                    raw = store.getItem(SCORE_KEY)
+                    data = json.loads(raw) if raw else {}
+                else:
+                    with open(SCORE_FILE, encoding="utf-8") as f:
+                        data = json.load(f)
                 for n in best:
                     best[n] = int(data.get(n, 0))
-            except (OSError, ValueError, TypeError, AttributeError):
+            except Exception:   # missing or corrupt file/storage: start with no best scores
                 pass
         return best
 
@@ -2364,9 +2391,13 @@ class Game:
         self.best[difficulty] = score
         if self.save_scores:
             try:
-                with open(SCORE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(self.best, f)
-            except OSError:
+                store = browser_storage()
+                if store is not None:
+                    store.setItem(SCORE_KEY, json.dumps(self.best))
+                else:
+                    with open(SCORE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(self.best, f)
+            except Exception:   # read-only disk or storage blocked: keep it for this session only
                 pass
         return True
 
@@ -2384,11 +2415,24 @@ class Game:
             self.ui.draw(self.screen, f"{self.clock.get_fps():.0f} FPS   {self.renderer.faces_drawn} polys",
                          20, UI_TEXT, (SCREEN_W * 0.5, 8), "midtop")
 
-    def run(self):
+    async def run(self):
         while self.running:
             dt = min(self.clock.tick(TARGET_FPS) / 1000.0, 0.05)
             self.frame(dt, pygame.event.get())
             pygame.display.flip()
+            await asyncio.sleep(0)    # hand control back to the browser each frame (pygbag)
+        pygame.quit()
+
+
+def browser_storage():
+    """The web page's localStorage when running in a browser (pygbag), else None."""
+    if not WEB:
+        return None
+    try:
+        import platform as browser   # pygbag exposes the JavaScript window object here
+        return browser.window.localStorage
+    except Exception:
+        return None
 
 
 def _autopilot(play, route):
@@ -2496,6 +2540,10 @@ def smoke_test(frames=600):
             assert isinstance(game.state, MenuState), "back to menu"
             game.mouse_override = None
         run(20)
+        pygame.event.post(Event(pygame.QUIT))     # the real (async) main loop: one frame, then quit
+        asyncio.run(game.run())
+        assert not game.running, "main loop should stop on QUIT"
+        print("async main loop: ok")
         print("SMOKE TEST PASSED")
         return 0
     except Exception:
@@ -2511,11 +2559,7 @@ def main():
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         sys.exit(smoke_test())
-    game = Game()
-    try:
-        game.run()
-    finally:
-        pygame.quit()
+    asyncio.run(Game().run())
 
 
 if __name__ == "__main__":
